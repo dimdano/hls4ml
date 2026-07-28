@@ -13,6 +13,14 @@ array set opt {
 }
 
 set tcldir [file dirname [info script]]
+
+# When run through `vitis-run --mode hls` (Vitis 2020.2+, no vivado_hls/vitis_hls
+# standalone binary), options aren't passed via $::argv, so build_opt.tcl (written
+# per-build by VivadoAcceleratorBackend.build()) overrides the defaults above instead.
+if {[file exists [file join $tcldir build_opt.tcl]]} {
+    source [file join $tcldir build_opt.tcl]
+}
+
 source [file join $tcldir project.tcl]
 
 proc remove_recursive_log_wave {} {

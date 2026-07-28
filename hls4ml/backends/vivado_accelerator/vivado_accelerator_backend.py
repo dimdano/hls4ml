@@ -1,4 +1,5 @@
 import os
+import sys
 
 from hls4ml.backends import VivadoBackend
 from hls4ml.model.flow import register_flow
@@ -24,18 +25,36 @@ class VivadoAcceleratorBackend(VivadoBackend):
         fifo_opt=False,
         bitfile=False,
     ):
-        # run the VivadoBackend build
-        super().build(
-            model,
-            reset=reset,
-            csim=csim,
-            synth=synth,
-            cosim=cosim,
-            validation=validation,
-            export=export,
-            vsynth=vsynth,
-            fifo_opt=fifo_opt,
+        # HLS synthesis via vitis-run: Vitis 2020.2+ (incl. 2025.1) no longer ships a
+        # standalone vivado_hls/vitis_hls binary, so we can't use VivadoBackend.build()
+        # as-is. Mirrors VitisBackend.build(), writing options to build_opt.tcl since
+        # vitis-run doesn't forward extra args as $::argv to the tcl script.
+        if 'linux' in sys.platform:
+            found_vrun = os.system('command -v vitis-run > /dev/null') == 0
+            if not found_vrun:
+                raise Exception('Vitis installation not found. Make sure "vitis-run" is on PATH.')
+
+        output_dir = model.config.get_output_dir()
+        build_opts = (
+            'array set opt {\n'
+            f'    reset      {int(reset)}\n'
+            f'    csim       {int(csim)}\n'
+            f'    synth      {int(synth)}\n'
+            f'    cosim      {int(cosim)}\n'
+            f'    validation {int(validation)}\n'
+            f'    export     {int(export)}\n'
+            f'    vsynth     {int(vsynth)}\n'
+            f'    fifo_opt   {int(fifo_opt)}\n'
+            '}\n'
         )
+        with open(os.path.join(output_dir, 'build_opt.tcl'), 'w') as f:
+            f.write(build_opts)
+
+        curr_dir = os.getcwd()
+        os.chdir(output_dir)
+        os.system('vitis-run --tcl build_prj.tcl --mode hls')
+        os.chdir(curr_dir)
+
         # Get Config to view Board and Platform
         from hls4ml.backends import VivadoAcceleratorConfig
 

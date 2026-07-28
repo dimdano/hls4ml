@@ -1,4 +1,5 @@
 import os
+import re
 from shutil import copyfile, copytree
 
 from hls4ml.writer.vivado_writer import VivadoWriter
@@ -30,6 +31,16 @@ class VivadoAcceleratorWriter(VivadoWriter):
                 newline = line.replace('MYPROJECT', format(model.config.get_project_name().upper()))
             elif '// hls-fpga-machine-learning insert include' in line:
                 newline = f'#include "{model.config.get_project_name()}.h"\n'
+                if self.vivado_accelerator_config.get_interface() == 'axi_stream':
+                    newline += '#include "ap_axi_sdata.h"\n'
+            elif '// hls-fpga-machine-learning insert signature' in line:
+                if self.vivado_accelerator_config.get_interface() == 'axi_stream':
+                    newline = (
+                        f'void {model.config.get_project_name()}_axi('
+                        'hls::stream<input_axi_t> &in, hls::stream<output_axi_t> &out);\n'
+                    )
+                else:
+                    newline = f'void {model.config.get_project_name()}_axi(input_axi_t in[N_IN], output_axi_t out[N_OUT]);\n'
             elif 'myproject' in line:
                 newline = line.replace('myproject', model.config.get_project_name())
             elif '// hls-fpga-machine-learning insert definitions' in line:
@@ -39,53 +50,36 @@ class VivadoAcceleratorWriter(VivadoWriter):
                 if self.vivado_accelerator_config.get_interface() == 'axi_stream':
                     newline += f'typedef {inp_axi_t} T_in;\n'
                     newline += f'typedef {out_axi_t} T_out;\n'
+                    # hls::axis<> is Xilinx's own AXI4-Stream side-channel struct (from
+                    # ap_axi_sdata.h) -- its 'data'/'last' fields are what our enqueue/dequeue
+                    # code already reads/writes. A hand-rolled struct with a field merely
+                    # *named* 'last' was found to not reliably bind to the physical TLAST
+                    # signal for hls::stream<T> AXI-stream ports in Vitis HLS 2025.1 (real
+                    # S2MM DMAIntErr on hardware, confirmed at the register level, independent
+                    # of any PS-side/driver code); hls::axis<> is the tool-blessed type built
+                    # specifically for this and doesn't have that problem.
+                    # EnableSignals restricted to AXIS_ENABLE_LAST only -- hls::axis<>'s
+                    # default also turns on TKEEP/TSTRB, which our original minimal
+                    # data+last interface never had; leaving them on caused the S2MM DMA
+                    # to hang waiting for a TKEEP handshake that wasn't wired up correctly
+                    # in the block design.
+                    newline += f'typedef hls::axis<T_in, 0, 0, 0, AXIS_ENABLE_LAST> input_axi_t;\n'
+                    newline += f'typedef hls::axis<T_out, 0, 0, 0, AXIS_ENABLE_LAST> output_axi_t;\n'
+                    # hls::axis<> has no operator<<, but the csim testbench's debug print
+                    # (nnet::print_result) expects one for whatever type it's given. Defined
+                    # inside namespace hls (not the global namespace) so it's actually found
+                    # via argument-dependent lookup when called on an hls::axis<> value.
                     newline += (
-                        'typedef struct in_struct {\n'
+                        'namespace hls {\n'
+                        'template <typename T, std::size_t WUser, std::size_t WId, std::size_t WDest,\n'
+                        '          uint8_t EnableSignals, bool StrictEnablement>\n'
+                        'std::ostream& operator<<(\n'
+                        '    std::ostream& stream,\n'
+                        '    const axis<T, WUser, WId, WDest, EnableSignals, StrictEnablement>& val) {\n'
                         + indent
-                        + 'T_in data;\n'
-                        + indent
-                        + 'ap_uint<1> last;\n'
-                        + indent
-                        + 'in_struct(const T_in& data, const ap_uint<1>& last){this->data = data; this->last = last;};\n'
-                        + indent
-                        + 'in_struct(){this->data = 0; this->last = 0;};\n'
-                        + indent
-                        + 'friend std::ostream& operator<<(std::ostream& stream, const in_struct& in)\n'
-                        + indent
-                        + '{ return stream << "{ data: " << in.data << ", last: " << in.last << " }" << std::endl; }\n'
-                        + indent
-                        + 'operator float() const {return this->data;}\n'
-                        + indent
-                        + 'operator double() const {return this->data;}\n'
-                        + indent
-                        + 'in_struct(float data) {this->data = data; this->last = 0;}\n'
-                        + indent
-                        + 'in_struct(double data) {this->data = data; this->last = 0;}\n'
-                        + '} input_axi_t;\n'
-                    )
-                    newline += (
-                        'typedef struct out_struct {\n'
-                        + indent
-                        + 'T_out data;\n'
-                        + indent
-                        + 'ap_uint<1> last;\n'
-                        + indent
-                        + 'out_struct(const T_out& data, const ap_uint<1>& last){this->data = data; this->last = last;};\n'
-                        + indent
-                        + 'out_struct(){this->data = 0; this->last = 0;};\n'
-                        + indent
-                        + 'friend std::ostream& operator<<(std::ostream& stream, const out_struct& out)\n'
-                        + indent
-                        + '{ return stream << "{ data: " << out.data << ", last: " << out.last << " }" << std::endl; }\n'
-                        + indent
-                        + 'operator float() const {return this->data;}\n'
-                        + indent
-                        + 'operator double() const {return this->data;}\n'
-                        + indent
-                        + 'out_struct(float data) {this->data = data; this->last = 0;}\n'
-                        + indent
-                        + 'out_struct(double data) {this->data = data; this->last = 0;}\n'
-                        + '} output_axi_t;\n'
+                        + 'return stream << "{ data: " << val.data << ", last: " << val.last << " }";\n'
+                        + '}\n'
+                        + '} // namespace hls\n'
                     )
                 else:
                     newline += f'typedef {inp_axi_t} input_axi_t;\n'
@@ -110,6 +104,16 @@ class VivadoAcceleratorWriter(VivadoWriter):
                 newline = line.replace('myproject', model.config.get_project_name())
             elif '// hls-fpga-machine-learning insert include' in line:
                 newline = f'#include "{model.config.get_project_name()}_axi.h"\n'
+            elif '// hls-fpga-machine-learning insert signature' in line:
+                if self.vivado_accelerator_config.get_interface() == 'axi_stream':
+                    newline = (
+                        f'void {model.config.get_project_name()}_axi('
+                        'hls::stream<input_axi_t> &in, hls::stream<output_axi_t> &out) {\n'
+                    )
+                else:
+                    newline = (
+                        f'void {model.config.get_project_name()}_axi(input_axi_t in[N_IN], output_axi_t out[N_OUT]) {{\n'
+                    )
             elif '// hls-fpga-machine-learning insert local vars' in line:
                 newline = ''
                 if self.vivado_accelerator_config.get_interface() == 'axi_stream':
@@ -157,8 +161,9 @@ class VivadoAcceleratorWriter(VivadoWriter):
                     newline += indent + 'for(unsigned i = 0; i < N_IN; i++){\n'
                     if self.vivado_accelerator_config.get_interface() == 'axi_stream':
                         newline += indent + indent + '#pragma HLS PIPELINE\n'
-                        newline += indent + indent + 'in_local[i] = in[i].data; // Read input with cast\n'
-                        newline += indent + indent + 'is_last |= (in[i].last == 1)? true: false;\n'
+                        newline += indent + indent + 'input_axi_t elem = in.read();\n'
+                        newline += indent + indent + 'in_local[i] = elem.data; // Read input with cast\n'
+                        newline += indent + indent + 'is_last |= (elem.last == 1)? true: false;\n'
                     else:
                         newline += indent + indent + '#pragma HLS UNROLL\n'
                         newline += indent + indent + 'in_local[i] = in[i]; // Read input with cast\n'
@@ -172,15 +177,11 @@ class VivadoAcceleratorWriter(VivadoWriter):
                     newline += indent + indent + 'for(unsigned j = 0; j < {input_t}::size; j++) {{\n'
                     # newline += indent + indent + indent + '#pragma HLS UNROLL\n'
                     if self.vivado_accelerator_config.get_interface() == 'axi_stream':
+                        newline += indent + indent + indent + 'input_axi_t elem = in.read();\n'
                         newline += (
-                            indent
-                            + indent
-                            + indent
-                            + 'ctype[j] = typename {input_t}::value_type(in[i * {input_t}::size + j].data);\n'
+                            indent + indent + indent + 'ctype[j] = typename {input_t}::value_type(elem.data);\n'
                         )
-                        newline += (
-                            indent + indent + indent + 'is_last |= (in[i * {input_t}::size + j].last == 1)? true : false;\n'
-                        )
+                        newline += indent + indent + indent + 'is_last |= (elem.last == 1)? true : false;\n'
                     else:
                         newline += (
                             indent
@@ -199,8 +200,10 @@ class VivadoAcceleratorWriter(VivadoWriter):
                     newline += indent + 'for(unsigned i = 0; i < N_OUT; i++){\n'
                     if self.vivado_accelerator_config.get_interface() == 'axi_stream':
                         newline += indent + indent + '#pragma HLS PIPELINE\n'
-                        newline += indent + indent + 'out[i].data = out_local[i]; // Write output with cast\n'
-                        newline += indent + indent + 'out[i].last = (is_last && (i == N_OUT - 1))? true : false;\n'
+                        newline += indent + indent + 'output_axi_t elem;\n'
+                        newline += indent + indent + 'elem.data = out_local[i]; // Write output with cast\n'
+                        newline += indent + indent + 'elem.last = (is_last && (i == N_OUT - 1))? true : false;\n'
+                        newline += indent + indent + 'out.write(elem);\n'
                     else:
                         newline += indent + indent + '#pragma HLS UNROLL\n'
                         newline += indent + indent + 'out[i] = out_local[i]; // Write output with cast\n'
@@ -219,9 +222,10 @@ class VivadoAcceleratorWriter(VivadoWriter):
                             + indent
                             + 'bool last = (is_last && (i * {result_t}::size + j == N_OUT - 1)) ? true : false;\n'
                         )
-                        newline += (
-                            indent + indent + indent + 'out[i * {result_t}::size + j] = output_axi_t(ctype[j], last);\n'
-                        )
+                        newline += indent + indent + indent + 'output_axi_t axi_elem;\n'
+                        newline += indent + indent + indent + 'axi_elem.data = ctype[j];\n'
+                        newline += indent + indent + indent + 'axi_elem.last = last;\n'
+                        newline += indent + indent + indent + 'out.write(axi_elem);\n'
                     else:
                         newline += indent + indent + indent + 'out[i * {result_t}::size + j] = output_axi_t(ctype[j]);\n'
                     newline += indent + indent + '}}\n'
@@ -303,11 +307,25 @@ class VivadoAcceleratorWriter(VivadoWriter):
                 newline = ''
             elif f'{model.config.get_project_name()}(' in line:
                 indent_amount = line.split(model.config.get_project_name())[0]
-                newline = indent_amount + f'{model.config.get_project_name()}_axi(inputs,outputs);\n'
+                if self.vivado_accelerator_config.get_interface() == 'axi_stream':
+                    newline = (
+                        indent_amount + 'hls::stream<input_axi_t> in_stream;\n'
+                        + indent_amount + 'hls::stream<output_axi_t> out_stream;\n'
+                        + indent_amount + 'for (unsigned i = 0; i < N_IN; i++) in_stream.write(inputs[i]);\n'
+                        + indent_amount + f'{model.config.get_project_name()}_axi(in_stream, out_stream);\n'
+                        + indent_amount + 'for (unsigned i = 0; i < N_OUT; i++) outputs[i] = out_stream.read();\n'
+                    )
+                else:
+                    newline = indent_amount + f'{model.config.get_project_name()}_axi(inputs,outputs);\n'
             elif inp.name in line or inp.type.name in line:
-                newline = line.replace(inp.name, 'inputs').replace(inp.type.name, 'input_axi_t')
+                # word-boundary substitution: inp.name can be a substring of inp.type.name
+                # (e.g. 'input' in 'input_t'), so a plain str.replace() in either order can
+                # corrupt one replacement with the other
+                newline = re.sub(rf'\b{re.escape(inp.type.name)}\b', 'input_axi_t', line)
+                newline = re.sub(rf'\b{re.escape(inp.name)}\b', 'inputs', newline)
             elif out.name in line or out.type.name in line:
-                newline = line.replace(out.name, 'outputs').replace(out.type.name, 'output_axi_t')
+                newline = re.sub(rf'\b{re.escape(out.type.name)}\b', 'output_axi_t', line)
+                newline = re.sub(rf'\b{re.escape(out.name)}\b', 'outputs', newline)
             else:
                 newline = line
             if self.vivado_accelerator_config.get_interface() == 'axi_stream':
@@ -343,9 +361,18 @@ class VivadoAcceleratorWriter(VivadoWriter):
                 newline = line.replace(out.definition_cpp(name_suffix='_ap'), f'output_axi_t {out.name}_ap[N_OUT]')
             elif f'{model.config.get_project_name()}(' in line:
                 indent_amount = line.split(model.config.get_project_name())[0]
-                newline = indent_amount + '{}_axi({}_ap,{}_ap);\n'.format(
-                    model.config.get_project_name(), inp.name, out.name
-                )
+                if self.vivado_accelerator_config.get_interface() == 'axi_stream':
+                    newline = (
+                        indent_amount + 'hls::stream<input_axi_t> in_stream;\n'
+                        + indent_amount + 'hls::stream<output_axi_t> out_stream;\n'
+                        + indent_amount + f'for (unsigned i = 0; i < N_IN; i++) in_stream.write({inp.name}_ap[i]);\n'
+                        + indent_amount + f'{model.config.get_project_name()}_axi(in_stream, out_stream);\n'
+                        + indent_amount + f'for (unsigned i = 0; i < N_OUT; i++) {out.name}_ap[i] = out_stream.read();\n'
+                    )
+                else:
+                    newline = indent_amount + '{}_axi({}_ap,{}_ap);\n'.format(
+                        model.config.get_project_name(), inp.name, out.name
+                    )
             elif inp.type.name in line:
                 newline = line.replace(inp.type.name, 'input_axi_t')
             elif out.type.name in line:
