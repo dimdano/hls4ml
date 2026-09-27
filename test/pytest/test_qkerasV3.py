@@ -191,6 +191,29 @@ def test_single_dense_activation_exact(test_case_id, randX_100_16, bits, alpha, 
         np.testing.assert_allclose(y_qkeras.ravel(), y_hls4ml.ravel(), atol=2**-bits, rtol=1.0)
 
 
+def test_quantized_bits_activation_merges_into_dense(test_case_id):
+    """A QActivation(quantized_bits) after a QDense casts its output: merging it into the Dense must keep that cast."""
+    model = Sequential(
+        [
+            QDense(
+                8,
+                input_shape=(16,),
+                name='fc1',
+                kernel_quantizer=quantized_bits(8, 0, alpha=1),
+                bias_quantizer=quantized_bits(8, 0, alpha=1),
+            ),
+            QActivation(activation=quantized_bits(8, 2), name='out_quant'),
+        ]
+    )
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name', backend='Vivado')
+    output_dir = str(test_root_path / test_case_id)
+    hls_model = hls4ml.converters.convert_from_keras_model(model, hls_config=config, output_dir=output_dir, backend='Vivado')
+
+    assert 'out_quant' not in [layer.name for layer in hls_model.get_layers()]
+    precision = hls_model.graph['fc1'].get_output_variable().type.precision
+    assert (precision.width, precision.integer, precision.signed) == (8, 3, True)
+
+
 @pytest.fixture
 def make_btnn(test_no, N, kernel_quantizer, bias_quantizer, activation_quantizer, use_batchnorm, is_xnor):
     shape = (N,)

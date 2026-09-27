@@ -41,5 +41,9 @@ class MergeLinearActivation(OptimizerPass):
         if quantizer is not None:
             prev_node.set_attr('quantizer', quantizer)
             prev_node.get_output_variable().type.precision = quantizer.hls_type
+        else:
+            precision = node.get_output_variable().type.precision
+            if not isinstance(precision, UnspecifiedPrecisionType):
+                prev_node.get_output_variable().type.precision = precision
         model.remove_node(node)
         return True
